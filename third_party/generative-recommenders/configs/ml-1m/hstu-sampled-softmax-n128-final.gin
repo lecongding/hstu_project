@@ -34,7 +34,7 @@ train_fn.top_k_method = "MIPSBruteForceTopK"
 train_fn.loss_module = "SampledSoftmaxLoss"
 train_fn.num_negatives = 128
 
-train_fn.sampling_strategy = "local"
+train_fn.sampling_strategy = "in-batch"
 train_fn.temperature = 0.05
 train_fn.item_l2_norm = True
 train_fn.l2_norm_eps = 1e-6
