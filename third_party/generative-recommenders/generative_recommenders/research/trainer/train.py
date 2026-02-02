@@ -89,6 +89,53 @@ def get_weighted_loss(
         weighted_loss = weighted_loss + cur_weighted_loss
     return weighted_loss
 
+from torch.utils.data import DataLoader
+
+def compute_item_logQ_from_train_dataset(
+    train_dataset,
+    num_items: int,
+    batch_size: int = 4096,
+    num_workers: int = 0,
+) -> torch.Tensor:
+    """
+    返回: item_logQ float32 tensor, shape [num_items+1]
+    Q 基于：历史序列有效位置 + target_ids 的出现次数
+    """
+    counts = torch.zeros(num_items + 1, dtype=torch.float64)
+
+    loader = DataLoader(
+        train_dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=False,
+        drop_last=False,
+    )
+
+    for row in loader:
+        hist_ids = row["historical_ids"].long()           # [B, N]
+        lengths = row["history_lengths"].long()           # [B]
+        tgt_ids = row["target_ids"].long()                # [B]
+
+        B, N = hist_ids.shape
+        arange = torch.arange(N).unsqueeze(0)             # [1, N]
+        mask = arange < lengths.unsqueeze(1)              # [B, N]
+        valid_hist = hist_ids[mask]                       # [M]
+
+        # 历史计数
+        valid_hist = valid_hist.clamp(0, num_items)
+        counts.scatter_add_(0, valid_hist, torch.ones_like(valid_hist, dtype=torch.float64))
+
+        # target 计数
+        tgt_ids = tgt_ids.clamp(0, num_items)
+        counts.scatter_add_(0, tgt_ids, torch.ones_like(tgt_ids, dtype=torch.float64))
+
+    total = counts[1:].sum().clamp_min(1.0)   # 忽略 0
+    q = counts / total
+    q[0] = 0.0
+    logq = torch.log(q.clamp_min(1e-12)).float()
+    return logq
+
 
 @gin.configurable
 def train_fn(
@@ -144,7 +191,32 @@ def train_fn(
         chronological=True,
         positional_sampling_ratio=positional_sampling_ratio,
     )
+    
+    
+    
+    num_items = dataset.max_item_id  # 物品数上界（id 1..num_items）
 
+    # rank0 统计 logQ，然后广播给所有 rank
+    if rank == 0:
+        item_logQ_cpu = compute_item_logQ_from_train_dataset(
+            dataset.train_dataset,
+            num_items=num_items,
+            batch_size=4096,
+            num_workers=0,   # 先用0最稳；你确认没问题后可调大
+        )
+    else:
+        item_logQ_cpu = torch.empty(num_items + 1, dtype=torch.float32)
+
+    if world_size > 1:
+        # broadcast 需要 tensor 在同一 device 上；这里用 CPU broadcast 最简单
+        dist.broadcast(item_logQ_cpu, src=0)
+
+    # 训练用：搬到当前 device
+    item_logQ = item_logQ_cpu.to(device)
+    
+    
+    
+    
     train_data_sampler, train_data_loader = create_data_loader(
         dataset.train_dataset,
         batch_size=local_batch_size,
@@ -220,12 +292,18 @@ def train_fn(
         loss_debug_str = "ssl"
         if temperature != 1.0:
             loss_debug_str += f"-t{temperature}"
+        pop_alpha = 0.1  # 建议从 0.05/0.1/0.2 扫
+
         ar_loss = SampledSoftmaxLoss(
             num_to_sample=num_negatives,
             softmax_temperature=temperature,
             model=model,
             activation_checkpoint=loss_activation_checkpoint,
+            item_logQ=item_logQ,
+            pop_alpha=pop_alpha,
+            num_items=num_items,   # 如果你做了 clamp 保护
         )
+
         loss_debug_str += (
             f"-n{num_negatives}{'-ac' if loss_activation_checkpoint else ''}"
         )

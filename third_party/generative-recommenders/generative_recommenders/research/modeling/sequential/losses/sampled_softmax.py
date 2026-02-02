@@ -31,6 +31,9 @@ class SampledSoftmaxLoss(AutoregressiveLoss):
         softmax_temperature: float,
         model,
         activation_checkpoint: bool = False,
+        # === 新增：流行度校正 ===
+        item_logQ: torch.Tensor = None,   # shape [num_items+1]
+        pop_alpha: float = 0.0,           # 0 表示不开启
     ) -> None:
         super().__init__()
 
@@ -38,6 +41,27 @@ class SampledSoftmaxLoss(AutoregressiveLoss):
         self._softmax_temperature: float = softmax_temperature
         self._model = model
         self._activation_checkpoint: bool = activation_checkpoint
+
+        self._pop_alpha: float = float(pop_alpha)
+        if item_logQ is not None:
+            # register_buffer 让它跟着 .to(device)、DDP 同步
+            self.register_buffer("_item_logQ", item_logQ.float())
+        else:
+            self._item_logQ = None
+
+    def _apply_pop_correction_pos(self, logits: torch.Tensor, pos_ids: torch.Tensor) -> torch.Tensor:
+        """logits: [N',1], pos_ids: [N']"""
+        if (self._item_logQ is None) or (self._pop_alpha <= 0.0):
+            return logits
+        logQ = self._item_logQ[pos_ids].to(device=logits.device, dtype=logits.dtype).unsqueeze(1)  # [N',1]
+        return logits - (self._pop_alpha * logQ)
+
+    def _apply_pop_correction_neg(self, logits: torch.Tensor, neg_ids: torch.Tensor) -> torch.Tensor:
+        """logits: [N',R], neg_ids: [N',R]"""
+        if (self._item_logQ is None) or (self._pop_alpha <= 0.0):
+            return logits
+        logQ = self._item_logQ[neg_ids].to(device=logits.device, dtype=logits.dtype)  # [N',R]
+        return logits - (self._pop_alpha * logQ)
 
     def jagged_forward(  # pyre-ignore [15]
         self,
@@ -47,42 +71,50 @@ class SampledSoftmaxLoss(AutoregressiveLoss):
         supervision_weights: torch.Tensor,
         negatives_sampler: NegativesSampler,
         **kwargs,
-    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+    ):
         assert output_embeddings.size() == supervision_embeddings.size()
         assert supervision_ids.size() == supervision_embeddings.size()[:-1]
         assert supervision_ids.size() == supervision_weights.size()
-
+    
         sampled_ids, sampled_negative_embeddings = negatives_sampler(
             positive_ids=supervision_ids,
             num_to_sample=self._num_to_sample,
         )
-        positive_embeddings = negatives_sampler.normalize_embeddings(
-            supervision_embeddings
-        )
+        positive_embeddings = negatives_sampler.normalize_embeddings(supervision_embeddings)
+
         positive_logits, aux_losses = self._model.similarity_fn(
-            query_embeddings=output_embeddings,  # [B, D] = [N', D]
-            item_ids=supervision_ids.unsqueeze(1),  # [N', 1]
-            item_embeddings=positive_embeddings.unsqueeze(1),  # [N', D] -> [N', 1, D]
+            query_embeddings=output_embeddings,                    # [N', D]
+            item_ids=supervision_ids.unsqueeze(1),                 # [N', 1]
+            item_embeddings=positive_embeddings.unsqueeze(1),       # [N', 1, D]
             **kwargs,
         )
-        positive_logits = positive_logits / self._softmax_temperature  # [0]
+        # 先 /T，再 -alpha*logQ
+        positive_logits = positive_logits / self._softmax_temperature
+        positive_logits = self._apply_pop_correction_pos(positive_logits, supervision_ids)
+
         sampled_negatives_logits, _ = self._model.similarity_fn(
-            query_embeddings=output_embeddings,  # [N', D]
-            item_ids=sampled_ids,  # [N', R]
-            item_embeddings=sampled_negative_embeddings,  # [N', R, D]
+            query_embeddings=output_embeddings,                   # [N', D]
+            item_ids=sampled_ids,                                 # [N', R]
+            item_embeddings=sampled_negative_embeddings,          # [N', R, D]
             **kwargs,
-        )  # [N', R]  # [0]
-        sampled_negatives_logits = torch.where(
-            supervision_ids.unsqueeze(1) == sampled_ids,  # [N', R]
-            -5e4,
-            sampled_negatives_logits / self._softmax_temperature,
         )
+        sampled_negatives_logits = sampled_negatives_logits / self._softmax_temperature
+        sampled_negatives_logits = self._apply_pop_correction_neg(sampled_negatives_logits, sampled_ids)
+
+        # 屏蔽：负样本里出现正样本 id 的位置
+        sampled_negatives_logits = torch.where(
+            supervision_ids.unsqueeze(1) == sampled_ids,
+            -5e4,
+            sampled_negatives_logits,
+        )
+
         jagged_loss = -F.log_softmax(
-            torch.cat([positive_logits, sampled_negatives_logits], dim=1), dim=1
+            torch.cat([positive_logits, sampled_negatives_logits], dim=1),
+            dim=1,
         )[:, 0]
-        return (
-            jagged_loss * supervision_weights
-        ).sum() / supervision_weights.sum(), aux_losses
+
+        return (jagged_loss * supervision_weights).sum() / supervision_weights.sum(), aux_losses
+
 
     def forward(  # pyre-ignore [15]
         self,
