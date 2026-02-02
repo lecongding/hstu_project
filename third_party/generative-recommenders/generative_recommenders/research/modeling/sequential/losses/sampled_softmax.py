@@ -58,15 +58,13 @@ class SampledSoftmaxLoss(AutoregressiveLoss):
         return logits - (self._pop_alpha * logQ)
 
     def _apply_pop_correction_neg(self, logits: torch.Tensor, neg_ids: torch.Tensor) -> torch.Tensor:
-        """logits: [N',R], neg_ids: [N',R]"""
-        max_id = self._num_items if self._num_items is not None else (self._item_logQ.numel() - 1)
-        pos_ids = pos_ids.clamp(min=0, max=max_id)
-        neg_ids = neg_ids.clamp(min=0, max=max_id)
-
         if (self._item_logQ is None) or (self._pop_alpha <= 0.0):
             return logits
-        logQ = self._item_logQ[neg_ids].to(device=logits.device, dtype=logits.dtype)  # [N',R]
+        max_id = self._num_items if self._num_items is not None else (self._item_logQ.numel() - 1)
+        neg_ids = neg_ids.clamp(min=0, max=max_id)
+        logQ = self._item_logQ[neg_ids].to(dtype=logits.dtype)  # [N', R]
         return logits - (self._pop_alpha * logQ)
+
 
     def jagged_forward(  # pyre-ignore [15]
         self,
