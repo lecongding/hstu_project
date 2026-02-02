@@ -184,6 +184,7 @@ def train_fn(
     logging.info(f"cudnn.allow_tf32: {enable_tf32}")
     logging.info(f"Training model on rank {rank}.")
     setup(rank, world_size, master_port)
+    device = rank
 
     dataset = get_reco_dataset(
         dataset_name=dataset_name,
