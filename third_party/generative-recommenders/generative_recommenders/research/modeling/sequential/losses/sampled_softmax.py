@@ -31,23 +31,24 @@ class SampledSoftmaxLoss(AutoregressiveLoss):
         softmax_temperature: float,
         model,
         activation_checkpoint: bool = False,
-        # === 新增：流行度校正 ===
-        item_logQ: torch.Tensor = None,   # shape [num_items+1]
-        pop_alpha: float = 0.0,           # 0 表示不开启
+        item_logQ: torch.Tensor = None,
+        pop_alpha: float = 0.0,
+        num_items: int = None,   # ✅ 新增
     ) -> None:
         super().__init__()
-
-        self._num_to_sample: int = num_to_sample
-        self._softmax_temperature: float = softmax_temperature
+        self._num_to_sample = num_to_sample
+        self._softmax_temperature = softmax_temperature
         self._model = model
-        self._activation_checkpoint: bool = activation_checkpoint
+        self._activation_checkpoint = activation_checkpoint
 
-        self._pop_alpha: float = float(pop_alpha)
+        self._pop_alpha = float(pop_alpha)
+        self._num_items = int(num_items) if num_items is not None else None  # ✅ 新增
+
         if item_logQ is not None:
-            # register_buffer 让它跟着 .to(device)、DDP 同步
             self.register_buffer("_item_logQ", item_logQ.float())
         else:
             self._item_logQ = None
+
 
     def _apply_pop_correction_pos(self, logits: torch.Tensor, pos_ids: torch.Tensor) -> torch.Tensor:
         """logits: [N',1], pos_ids: [N']"""
@@ -58,6 +59,10 @@ class SampledSoftmaxLoss(AutoregressiveLoss):
 
     def _apply_pop_correction_neg(self, logits: torch.Tensor, neg_ids: torch.Tensor) -> torch.Tensor:
         """logits: [N',R], neg_ids: [N',R]"""
+        max_id = self._num_items if self._num_items is not None else (self._item_logQ.numel() - 1)
+        pos_ids = pos_ids.clamp(min=0, max=max_id)
+        neg_ids = neg_ids.clamp(min=0, max=max_id)
+
         if (self._item_logQ is None) or (self._pop_alpha <= 0.0):
             return logits
         logQ = self._item_logQ[neg_ids].to(device=logits.device, dtype=logits.dtype)  # [N',R]
