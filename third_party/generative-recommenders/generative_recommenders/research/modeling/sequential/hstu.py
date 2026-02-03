@@ -288,27 +288,51 @@ def _hstu_attention_maybe_from_cache(
     mask_h = invalid_attn_mask.unsqueeze(1)  # [B,1,N,N]
 
     # 4) plain attention: relu(QK^T)/N
-    qk_plain = torch.einsum("bnhd,bmhd->bhnm", q4, k4)  # [B,H,N,N]
+    qh0 = q4.permute(0, 2, 1, 3).contiguous()  # [B,H,N,d]
+    kh0 = k4.permute(0, 2, 1, 3).contiguous()  # [B,H,N,d]
+    qk_plain = torch.einsum("bhnd,bhmd->bhnm", qh0, kh0)  # [B,H,N,N]
     qk_plain = F.relu(qk_plain) / n
     qk_plain = qk_plain * mask_h
 
-    attn_plain = torch.einsum("bhnm,bmhd->bnhd", qk_plain, padded_v)  # [B,N,H,dv]
+    vh0 = padded_v.permute(0, 2, 1, 3).contiguous()  # [B,H,N,dv]
+    attn_plain_h = torch.einsum("bhnm,bhmd->bhnd", qk_plain, vh0)  # [B,H,N,dv]
+    attn_plain = attn_plain_h.permute(0, 2, 1, 3).contiguous()     # [B,N,H,dv]
 
-    # 5) rope attention: relu(Q_rope K_rope^T)/N
+    del qh0, kh0, vh0, attn_plain_h, qk_plain
+
+        # 5) rope attention: relu(Q_rope K_rope^T)/N
     if rope is not None:
-        q_rope, k_rope = rope.apply_rotary(q4, k4)  # [B,N,H,d], [B,N,H,d]
-        qk_rope = torch.einsum("bnhd,bmhd->bhnm", q_rope, k_rope)
+        # 关键：RotaryEmbedding 期望 [B, H, N, d]，而你当前是 [B, N, H, d]
+        qh = q4.permute(0, 2, 1, 3).contiguous()  # [B,H,N,d]
+        kh = k4.permute(0, 2, 1, 3).contiguous()  # [B,H,N,d]
+
+        qh_rope, kh_rope = rope.apply_rotary(qh, kh)  # [B,H,N,d], [B,H,N,d]
+
+        # qk_rope: [B,H,N,N]
+        qk_rope = torch.einsum("bhnd,bhmd->bhnm", qh_rope, kh_rope)
         qk_rope = F.relu(qk_rope) / n
-        qk_rope = qk_rope * mask_h
-        attn_rope = torch.einsum("bhnm,bmhd->bnhd", qk_rope, padded_v)  # [B,N,H,dv]
+        qk_rope = qk_rope * mask_h  # mask_h 是 [B,1,N,N]，会广播到 [B,H,N,N]
+
+        # V 也转成 [B,H,N,dv]，这样 einsum 更直观
+        vh = padded_v.permute(0, 2, 1, 3).contiguous()  # [B,H,N,dv]
+        attn_rope_h = torch.einsum("bhnm,bhmd->bhnd", qk_rope, vh)  # [B,H,N,dv]
+
+        # 转回 [B,N,H,dv] 对齐你后面 concat 的格式
+        attn_rope = attn_rope_h.permute(0, 2, 1, 3).contiguous()  # [B,N,H,dv]
+
+        # （可选但强烈建议）立刻释放大张量，降低峰值显存
+        del qh, kh, qh_rope, kh_rope, qk_rope, vh, attn_rope_h
     else:
         attn_rope = torch.zeros_like(attn_plain)
+
 
     # 6) 显式时间桶聚合: ts_output = einsum(rel_ts_bias, V)
     if (all_timestamps is not None) and (rel_ts_bias_module is not None):
         rel_ts_bias = rel_ts_bias_module(all_timestamps)  # [B,N,N]
         rel_ts_bias = rel_ts_bias * invalid_attn_mask      # causal/valid mask
         ts_output = torch.einsum("bnm,bmhd->bnhd", rel_ts_bias, padded_v)  # [B,N,H,dv]
+        del rel_ts_bias
+
     else:
         ts_output = torch.zeros_like(attn_plain)
 
