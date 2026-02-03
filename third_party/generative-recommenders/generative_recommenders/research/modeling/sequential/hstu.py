@@ -46,6 +46,56 @@ from generative_recommenders.research.rails.similarities.module import Similarit
 
 TIMESTAMPS_KEY = "timestamps"
 
+class RotaryEmbedding(torch.nn.Module):
+    """
+    标准 RoPE（Rotary Positional Embedding）实现。
+    将每个 head 的前 rotary_dim 维旋转，其余维度保持不变。
+    q,k: [B, N, H, D]
+    """
+    def __init__(self, head_dim: int, rope_base: float = 10000.0, rope_fraction: float = 1.0) -> None:
+        super().__init__()
+        rotary_dim = int(head_dim * float(rope_fraction))
+        rotary_dim = max(2, rotary_dim - (rotary_dim % 2))
+        self.head_dim = head_dim
+        self.rotary_dim = rotary_dim
+
+        inv_freq = 1.0 / (rope_base ** (torch.arange(0, rotary_dim, 2, dtype=torch.float32) / rotary_dim))
+        self.register_buffer("inv_freq", inv_freq, persistent=False)
+
+    def _build_cos_sin(self, seq_len: int, device, dtype):
+        t = torch.arange(seq_len, device=device, dtype=dtype)  # [N]
+        freqs = torch.einsum("n,f->nf", t, self.inv_freq.to(device=device, dtype=dtype))  # [N, rd/2]
+        cos = torch.cos(freqs)
+        sin = torch.sin(freqs)
+        cos = torch.stack([cos, cos], dim=-1).reshape(seq_len, -1)  # [N, rd]
+        sin = torch.stack([sin, sin], dim=-1).reshape(seq_len, -1)  # [N, rd]
+        # broadcast 到 [B,N,H,rd]
+        cos = cos.unsqueeze(0).unsqueeze(2)  # [1,N,1,rd]
+        sin = sin.unsqueeze(0).unsqueeze(2)  # [1,N,1,rd]
+        return cos, sin
+
+    @staticmethod
+    def _rotate_half(x):
+        x1, x2 = x[..., ::2], x[..., 1::2]
+        x_rot = torch.stack((-x2, x1), dim=-1)
+        return x_rot.flatten(-2)
+
+    def apply_rotary(self, q: torch.Tensor, k: torch.Tensor):
+        # q,k: [B,N,H,D]
+        B, N, H, D = q.shape
+        assert D == self.head_dim
+
+        if self.rotary_dim <= 0:
+            return q, k
+        cos, sin = self._build_cos_sin(N, q.device, q.dtype)
+
+        def _apply(x):
+            x_rot = x[..., :self.rotary_dim]
+            x_pass = x[..., self.rotary_dim:]
+            x_rot = x_rot * cos + self._rotate_half(x_rot) * sin
+            return torch.cat([x_rot, x_pass], dim=-1)
+
+        return _apply(q), _apply(k)
 
 class RelativeAttentionBiasModule(torch.nn.Module):
     @abc.abstractmethod
@@ -82,6 +132,35 @@ class RelativePositionalBias(RelativeAttentionBiasModule):
         r = (2 * n - 1) // 2
         return t[..., r:-r]
 
+class RelativeBucketedTimeBias(RelativeAttentionBiasModule):
+    """
+    仅生成 bucketed 相对时间 bias: [B,N,N]
+    不叠加 positional bias（因为你的目标是 ts_output 分支，不是 logits + bias）。
+    """
+    def __init__(self, max_seq_len: int, num_buckets: int, bucketization_fn: Callable[[torch.Tensor], torch.Tensor]) -> None:
+        super().__init__()
+        self._max_seq_len = max_seq_len
+        self._num_buckets = num_buckets
+        self._bucketization_fn = bucketization_fn
+        self._ts_w = torch.nn.Parameter(torch.empty(num_buckets + 1).normal_(mean=0, std=0.02))
+
+    def forward(self, all_timestamps: torch.Tensor) -> torch.Tensor:
+        B = all_timestamps.size(0)
+        N = self._max_seq_len
+
+        # [B, N+1]，沿用标准实现的做法，避免边界处理差异
+        ext_timestamps = torch.cat([all_timestamps, all_timestamps[:, N - 1 : N]], dim=1)
+
+        bucketed = torch.clamp(
+            self._bucketization_fn(
+                ext_timestamps[:, 1:].unsqueeze(2) - ext_timestamps[:, :-1].unsqueeze(1)
+            ),
+            min=0,
+            max=self._num_buckets,
+        ).detach()  # [B,N,N]
+
+        rel_ts_bias = torch.index_select(self._ts_w, dim=0, index=bucketed.view(-1)).view(B, N, N)
+        return rel_ts_bias
 
 class RelativeBucketedTimeAndPositionBasedBias(RelativeAttentionBiasModule):
     """
@@ -159,10 +238,19 @@ def _hstu_attention_maybe_from_cache(
     x_offsets: torch.Tensor,
     all_timestamps: Optional[torch.Tensor],
     invalid_attn_mask: torch.Tensor,
-    rel_attn_bias: RelativeAttentionBiasModule,
+    rel_ts_bias_module: Optional[RelativeAttentionBiasModule],
+    rope: Optional[RotaryEmbedding],
+    attn_out_proj: Optional[torch.nn.Module],
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    返回:
+      attn_output: jagged [sum(N_i), H*dv]
+      padded_q/padded_k: [B,N,H*attention_dim] 用于 cache
+    """
     B: int = x_offsets.size(0) - 1
     n: int = invalid_attn_mask.size(-1)
+
+    # 1) 构造 padded_q/padded_k（用于 cache / 增量更新）
     if delta_x_offsets is not None:
         padded_q, padded_k = cached_q, cached_k
         flattened_offsets = delta_x_offsets[1] + torch.arange(
@@ -176,50 +264,68 @@ def _hstu_attention_maybe_from_cache(
         assert isinstance(padded_k, torch.Tensor)
         padded_q = (
             padded_q.view(B * n, -1)
-            .index_copy_(
-                dim=0,
-                index=flattened_offsets,
-                source=q,
-            )
+            .index_copy_(dim=0, index=flattened_offsets, source=q)
             .view(B, n, -1)
         )
         padded_k = (
             padded_k.view(B * n, -1)
-            .index_copy_(
-                dim=0,
-                index=flattened_offsets,
-                source=k,
-            )
+            .index_copy_(dim=0, index=flattened_offsets, source=k)
             .view(B, n, -1)
         )
     else:
-        padded_q = torch.ops.fbgemm.jagged_to_padded_dense(
-            values=q, offsets=[x_offsets], max_lengths=[n], padding_value=0.0
-        )
-        padded_k = torch.ops.fbgemm.jagged_to_padded_dense(
-            values=k, offsets=[x_offsets], max_lengths=[n], padding_value=0.0
-        )
+        padded_q = torch.ops.fbgemm.jagged_to_padded_dense(values=q, offsets=[x_offsets], max_lengths=[n], padding_value=0.0)
+        padded_k = torch.ops.fbgemm.jagged_to_padded_dense(values=k, offsets=[x_offsets], max_lengths=[n], padding_value=0.0)
 
-    qk_attn = torch.einsum(
-        "bnhd,bmhd->bhnm",
-        padded_q.view(B, n, num_heads, attention_dim),
-        padded_k.view(B, n, num_heads, attention_dim),
-    )
-    if all_timestamps is not None:
-        qk_attn = qk_attn + rel_attn_bias(all_timestamps).unsqueeze(1)
-    qk_attn = F.silu(qk_attn) / n
-    qk_attn = qk_attn * invalid_attn_mask.unsqueeze(0).unsqueeze(0)
-    attn_output = torch.ops.fbgemm.dense_to_jagged(
-        torch.einsum(
-            "bhnm,bmhd->bnhd",
-            qk_attn,
-            torch.ops.fbgemm.jagged_to_padded_dense(v, [x_offsets], [n]).reshape(
-                B, n, num_heads, linear_dim
-            ),
-        ).reshape(B, n, num_heads * linear_dim),
-        [x_offsets],
-    )[0]
+    # 2) padded_v
+    padded_v = torch.ops.fbgemm.jagged_to_padded_dense(values=v, offsets=[x_offsets], max_lengths=[n], padding_value=0.0)
+    padded_v = padded_v.view(B, n, num_heads, linear_dim)  # [B,N,H,dv]
+
+    # 3) reshape Q/K
+    q4 = padded_q.view(B, n, num_heads, attention_dim)  # [B,N,H,d]
+    k4 = padded_k.view(B, n, num_heads, attention_dim)  # [B,N,H,d]
+
+    # mask：invalid_attn_mask 是 (B,N,N) float 0/1，扩到 head 维
+    mask_h = invalid_attn_mask.unsqueeze(1)  # [B,1,N,N]
+
+    # 4) plain attention: relu(QK^T)/N
+    qk_plain = torch.einsum("bnhd,bmhd->bhnm", q4, k4)  # [B,H,N,N]
+    qk_plain = F.relu(qk_plain) / n
+    qk_plain = qk_plain * mask_h
+
+    attn_plain = torch.einsum("bhnm,bmhd->bnhd", qk_plain, padded_v)  # [B,N,H,dv]
+
+    # 5) rope attention: relu(Q_rope K_rope^T)/N
+    if rope is not None:
+        q_rope, k_rope = rope.apply_rotary(q4, k4)  # [B,N,H,d], [B,N,H,d]
+        qk_rope = torch.einsum("bnhd,bmhd->bhnm", q_rope, k_rope)
+        qk_rope = F.relu(qk_rope) / n
+        qk_rope = qk_rope * mask_h
+        attn_rope = torch.einsum("bhnm,bmhd->bnhd", qk_rope, padded_v)  # [B,N,H,dv]
+    else:
+        attn_rope = torch.zeros_like(attn_plain)
+
+    # 6) 显式时间桶聚合: ts_output = einsum(rel_ts_bias, V)
+    if (all_timestamps is not None) and (rel_ts_bias_module is not None):
+        rel_ts_bias = rel_ts_bias_module(all_timestamps)  # [B,N,N]
+        rel_ts_bias = rel_ts_bias * invalid_attn_mask      # causal/valid mask
+        ts_output = torch.einsum("bnm,bmhd->bnhd", rel_ts_bias, padded_v)  # [B,N,H,dv]
+    else:
+        ts_output = torch.zeros_like(attn_plain)
+
+    # 7) 三路 concat -> 投影回 [B,N,H*dv]
+    three = torch.cat([attn_plain, attn_rope, ts_output], dim=-1)  # [B,N,H,3*dv]
+    three = three.reshape(B, n, num_heads * linear_dim * 3)        # [B,N,3*H*dv]
+
+    if attn_out_proj is None:
+        # fallback：不投影（不推荐），但后续 u*... 会维度不匹配
+        merged = three
+    else:
+        merged = attn_out_proj(three)  # [B,N,H*dv]
+
+    # 8) padded -> jagged
+    attn_output = torch.ops.fbgemm.dense_to_jagged(merged, [x_offsets])[0]
     return attn_output, padded_q, padded_k
+
 
 
 class SequentialTransductionUnitJagged(torch.nn.Module):
@@ -238,6 +344,8 @@ class SequentialTransductionUnitJagged(torch.nn.Module):
         concat_ua: bool = False,
         epsilon: float = 1e-6,
         max_length: Optional[int] = None,
+        rope_fraction: float = 1.0,
+        rope_base: float = 10000.0
     ) -> None:
         super().__init__()
         self._embedding_dim: int = embedding_dim
@@ -265,6 +373,33 @@ class SequentialTransductionUnitJagged(torch.nn.Module):
             raise ValueError(f"Unknown linear_config {self._linear_config}")
         self._linear_activation: str = linear_activation
         self._concat_ua: bool = concat_ua
+        # --- 新增：RoPE & 时间桶 bias & 三路融合投影 ---
+        self._rope = RotaryEmbedding(
+            head_dim=attention_dim,
+            rope_base=rope_base,
+            rope_fraction=rope_fraction,
+        )
+
+        # 显式时间桶 bias（用于 ts_output 分支）
+        assert max_length is not None and max_length > 0, "max_length must be set for RelativeBucketedTimeBias"
+        self._rel_ts_bias: Optional[RelativeAttentionBiasModule] = (
+            RelativeBucketedTimeBias(
+                max_seq_len=max_length,  # 下面会说明怎么传
+                num_buckets=128,
+                bucketization_fn=lambda x: (torch.log(torch.abs(x).clamp(min=1)) / 0.301).long(),
+            )
+            if relative_attention_bias_module is not None
+            else None
+        )
+
+        # 三路 concat 后投影回原 attn_output 维度，保证后续 u * norm(attn_output) 不改代码
+        self._attn_out_proj = torch.nn.Linear(
+            in_features=linear_hidden_dim * num_heads * 3,
+            out_features=linear_hidden_dim * num_heads,
+            bias=False,
+        )
+        torch.nn.init.xavier_uniform_(self._attn_out_proj.weight)
+
         self._o = torch.nn.Linear(
             in_features=linear_hidden_dim * num_heads * (3 if concat_ua else 1),
             out_features=embedding_dim,
@@ -340,7 +475,8 @@ class SequentialTransductionUnitJagged(torch.nn.Module):
 
         B: int = x_offsets.size(0) - 1
         if self._normalization == "rel_bias" or self._normalization == "hstu_rel_bias":
-            assert self._rel_attn_bias is not None
+            assert self._rel_ts_bias is not None, "rel_ts_bias_module must be provided"
+
             attn_output, padded_q, padded_k = _hstu_attention_maybe_from_cache(
                 num_heads=self._num_heads,
                 attention_dim=self._attention_dim,
@@ -354,59 +490,12 @@ class SequentialTransductionUnitJagged(torch.nn.Module):
                 x_offsets=x_offsets,
                 all_timestamps=all_timestamps,
                 invalid_attn_mask=invalid_attn_mask,
-                rel_attn_bias=self._rel_attn_bias,
+                rel_ts_bias_module=self._rel_ts_bias,
+                rope=self._rope,
+                attn_out_proj=self._attn_out_proj,
             )
-        elif self._normalization == "softmax_rel_bias":
-            if delta_x_offsets is not None:
-                B = x_offsets.size(0) - 1
-                padded_q, padded_k = cached_q, cached_k
-                flattened_offsets = delta_x_offsets[1] + torch.arange(
-                    start=0,
-                    end=B * n,
-                    step=n,
-                    device=delta_x_offsets[1].device,
-                    dtype=delta_x_offsets[1].dtype,
-                )
-                assert padded_q is not None
-                assert padded_k is not None
-                padded_q = (
-                    padded_q.view(B * n, -1)
-                    .index_copy_(
-                        dim=0,
-                        index=flattened_offsets,
-                        source=q,
-                    )
-                    .view(B, n, -1)
-                )
-                padded_k = (
-                    padded_k.view(B * n, -1)
-                    .index_copy_(
-                        dim=0,
-                        index=flattened_offsets,
-                        source=k,
-                    )
-                    .view(B, n, -1)
-                )
-            else:
-                padded_q = torch.ops.fbgemm.jagged_to_padded_dense(
-                    values=q, offsets=[x_offsets], max_lengths=[n], padding_value=0.0
-                )
-                padded_k = torch.ops.fbgemm.jagged_to_padded_dense(
-                    values=k, offsets=[x_offsets], max_lengths=[n], padding_value=0.0
-                )
 
-            qk_attn = torch.einsum("bnd,bmd->bnm", padded_q, padded_k)
-            if self._rel_attn_bias is not None:
-                qk_attn = qk_attn + self._rel_attn_bias(all_timestamps)
-            qk_attn = F.softmax(qk_attn / math.sqrt(self._attention_dim), dim=-1)
-            qk_attn = qk_attn * invalid_attn_mask
-            attn_output = torch.ops.fbgemm.dense_to_jagged(
-                torch.bmm(
-                    qk_attn,
-                    torch.ops.fbgemm.jagged_to_padded_dense(v, [x_offsets], [n]),
-                ),
-                [x_offsets],
-            )[0]
+        
         else:
             raise ValueError(f"Unknown normalization method {self._normalization}")
 
@@ -573,7 +662,7 @@ class HSTU(SequentialEncoderWithLearnedSimilarityModule):
         verbose: bool = True,
     ) -> None:
         super().__init__(ndp_module=similarity_module)
-
+        max_len_total = max_sequence_len + max_output_len
         self._embedding_dim: int = embedding_dim
         self._item_embedding_dim: int = embedding_module.item_embedding_dim
         self._max_sequence_length: int = max_sequence_len
@@ -600,15 +689,11 @@ class HSTU(SequentialEncoderWithLearnedSimilarityModule):
                     linear_config=linear_config,
                     linear_activation=linear_activation,
                     num_heads=num_heads,
-                    # TODO: change to lambda x.
                     relative_attention_bias_module=(
                         RelativeBucketedTimeAndPositionBasedBias(
-                            max_seq_len=max_sequence_len
-                            + max_output_len,  # accounts for next item.
+                            max_seq_len=max_len_total,
                             num_buckets=128,
-                            bucketization_fn=lambda x: (
-                                torch.log(torch.abs(x).clamp(min=1)) / 0.301
-                            ).long(),
+                            bucketization_fn=lambda x: (torch.log(torch.abs(x).clamp(min=1)) / 0.301).long(),
                         )
                         if enable_relative_attention_bias
                         else None
@@ -616,6 +701,7 @@ class HSTU(SequentialEncoderWithLearnedSimilarityModule):
                     dropout_ratio=linear_dropout_rate,
                     attn_dropout_ratio=attn_dropout_rate,
                     concat_ua=concat_ua,
+                    max_length=max_len_total,   # <<< 新增：传进去
                 )
                 for _ in range(num_blocks)
             ],
