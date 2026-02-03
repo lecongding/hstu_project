@@ -238,19 +238,26 @@ def _hstu_attention_maybe_from_cache(
     x_offsets: torch.Tensor,
     all_timestamps: Optional[torch.Tensor],
     invalid_attn_mask: torch.Tensor,
-    rel_ts_bias_module: Optional[RelativeAttentionBiasModule],
-    rope: Optional[RotaryEmbedding],
+    # ✅ 新增：标准 HSTU 的 additive bias（原来的 relative_attention_bias_module）
+    rel_attn_bias: Optional["RelativeAttentionBiasModule"],
+    # ✅ 你新增：显式时间桶聚合分支的 bias module
+    rel_ts_bias_module: Optional["RelativeAttentionBiasModule"],
+    rope: Optional["RotaryEmbedding"],
     attn_out_proj: Optional[torch.nn.Module],
+    # ✅ 显存友好：按 query 维分块，避免 [B,H,n,n] 巨张量峰值
+    q_chunk_size: int = 64,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
-    返回:
+    Returns:
       attn_output: jagged [sum(N_i), H*dv]
-      padded_q/padded_k: [B,N,H*attention_dim] 用于 cache
+      padded_q/padded_k: [B,n,H*attention_dim] for cache
     """
     B: int = x_offsets.size(0) - 1
-    n: int = invalid_attn_mask.size(-1)
+    n: int = int(invalid_attn_mask.size(-1))
 
-    # 1) 构造 padded_q/padded_k（用于 cache / 增量更新）
+    # ---------------------------
+    # 1) padded_q / padded_k
+    # ---------------------------
     if delta_x_offsets is not None:
         padded_q, padded_k = cached_q, cached_k
         flattened_offsets = delta_x_offsets[1] + torch.arange(
@@ -273,107 +280,157 @@ def _hstu_attention_maybe_from_cache(
             .view(B, n, -1)
         )
     else:
-        padded_q = torch.ops.fbgemm.jagged_to_padded_dense(values=q, offsets=[x_offsets], max_lengths=[n], padding_value=0.0)
-        padded_k = torch.ops.fbgemm.jagged_to_padded_dense(values=k, offsets=[x_offsets], max_lengths=[n], padding_value=0.0)
+        padded_q = torch.ops.fbgemm.jagged_to_padded_dense(
+            values=q, offsets=[x_offsets], max_lengths=[n], padding_value=0.0
+        )
+        padded_k = torch.ops.fbgemm.jagged_to_padded_dense(
+            values=k, offsets=[x_offsets], max_lengths=[n], padding_value=0.0
+        )
 
-    # 2) padded_v
-    padded_v = torch.ops.fbgemm.jagged_to_padded_dense(values=v, offsets=[x_offsets], max_lengths=[n], padding_value=0.0)
-    padded_v = padded_v.view(B, n, num_heads, linear_dim)  # [B,N,H,dv]
+    # ---------------------------
+    # 2) padded_v: [B,n,H,dv]
+    # ---------------------------
+    padded_v = torch.ops.fbgemm.jagged_to_padded_dense(
+        values=v, offsets=[x_offsets], max_lengths=[n], padding_value=0.0
+    ).view(B, n, num_heads, linear_dim)  # [B,n,H,dv]
 
-    # 3) reshape Q/K
-    q4 = padded_q.view(B, n, num_heads, attention_dim)  # [B,N,H,d]
-    k4 = padded_k.view(B, n, num_heads, attention_dim)  # [B,N,H,d]
+    # ---------------------------
+    # 3) q4/k4: [B,n,H,d]
+    # ---------------------------
+    q4 = padded_q.view(B, n, num_heads, attention_dim)
+    k4 = padded_k.view(B, n, num_heads, attention_dim)
 
-    # mask：invalid_attn_mask 是 (B,N,N) float 0/1，扩到 head 维
-    # ---- normalize invalid_attn_mask to [B, n, n] ----
+    # ---------------------------
+    # 4) normalize invalid mask to [B,n,n] and [B,1,n,n]
+    # ---------------------------
     if invalid_attn_mask.dim() == 2:
-        # original HSTU passes [n, n]
         invalid = invalid_attn_mask.unsqueeze(0).expand(B, -1, -1)  # [B,n,n]
     elif invalid_attn_mask.dim() == 3:
         invalid = invalid_attn_mask  # [B,n,n]
     else:
         raise ValueError(f"invalid_attn_mask must be 2D or 3D, got {invalid_attn_mask.shape}")
-
+    # 确保就是 [B,n,n]
+    if invalid.size(1) != n or invalid.size(2) != n:
+        invalid = invalid[:, :n, :n]
     mask_h = invalid.unsqueeze(1)  # [B,1,n,n]
 
-
-    # 4) plain attention: relu(QK^T)/N
-    qh0 = q4.permute(0, 2, 1, 3).contiguous()  # [B,H,N,d]
-    kh0 = k4.permute(0, 2, 1, 3).contiguous()  # [B,H,N,d]
-    qk_plain = torch.einsum("bhnd,bhmd->bhnm", qh0, kh0)  # [B,H,N,N]
-    qk_plain = F.relu(qk_plain) / n
-    qk_plain = qk_plain * mask_h
-
-    vh0 = padded_v.permute(0, 2, 1, 3).contiguous()  # [B,H,N,dv]
-    attn_plain_h = torch.einsum("bhnm,bhmd->bhnd", qk_plain, vh0)  # [B,H,N,dv]
-    attn_plain = attn_plain_h.permute(0, 2, 1, 3).contiguous()     # [B,N,H,dv]
-
-    del qh0, kh0, vh0, attn_plain_h, qk_plain
-
-        # 5) rope attention: relu(Q_rope K_rope^T)/N
-    if rope is not None:
-        # 关键：RotaryEmbedding 期望 [B, H, N, d]，而你当前是 [B, N, H, d]
-        qh = q4.permute(0, 2, 1, 3).contiguous()  # [B,H,N,d]
-        kh = k4.permute(0, 2, 1, 3).contiguous()  # [B,H,N,d]
-
-        qh_rope, kh_rope = rope.apply_rotary(qh, kh)  # [B,H,N,d], [B,H,N,d]
-
-        # qk_rope: [B,H,N,N]
-        qk_rope = torch.einsum("bhnd,bhmd->bhnm", qh_rope, kh_rope)
-        qk_rope = F.relu(qk_rope) / n
-        qk_rope = qk_rope * mask_h  # mask_h 是 [B,1,N,N]，会广播到 [B,H,N,N]
-
-        # V 也转成 [B,H,N,dv]，这样 einsum 更直观
-        vh = padded_v.permute(0, 2, 1, 3).contiguous()  # [B,H,N,dv]
-        attn_rope_h = torch.einsum("bhnm,bhmd->bhnd", qk_rope, vh)  # [B,H,N,dv]
-
-        # 转回 [B,N,H,dv] 对齐你后面 concat 的格式
-        attn_rope = attn_rope_h.permute(0, 2, 1, 3).contiguous()  # [B,N,H,dv]
-
-        # （可选但强烈建议）立刻释放大张量，降低峰值显存
-        del qh, kh, qh_rope, kh_rope, qk_rope, vh, attn_rope_h
-    else:
-        attn_rope = torch.zeros_like(attn_plain)
-
-
-        # 6) explicit time-bucket aggregation: ts_output = einsum(rel_ts_bias, V)
-    if (all_timestamps is not None) and (rel_ts_bias_module is not None):
+    # ---------------------------
+    # 5) 标准 additive bias（让原参数参与梯度，解决 DDP unused）
+    #    bias: [B,n,n]  -> bias_h: [B,1,n,n]
+    # ---------------------------
+    bias_h = None
+    if (all_timestamps is not None) and (rel_attn_bias is not None):
         ts = all_timestamps
-        # ts expected to be [B, n] (or >=n). Make it exactly [B, n]
         if ts.dim() != 2:
-            raise ValueError(f"all_timestamps must be [B, T], got {ts.shape}")
+            raise ValueError(f"all_timestamps must be [B,T], got {ts.shape}")
+        # 对齐到 [B,n]
         if ts.size(1) < n:
-            # pad with last timestamp to length n
             pad = ts[:, -1:].expand(-1, n - ts.size(1))
             ts = torch.cat([ts, pad], dim=1)
         elif ts.size(1) > n:
             ts = ts[:, :n]
 
-        rel_ts_bias = rel_ts_bias_module(ts)  # ideally [B,n,n] but may be bigger
-        # make it exactly [B,n,n]
+        b = rel_attn_bias(ts)  # 可能是 [1,n,n] 或 [B,n,n]
+        if b.dim() == 3 and b.size(0) == 1:
+            b = b.expand(B, -1, -1)
+        elif b.dim() == 2:
+            b = b.unsqueeze(0).expand(B, -1, -1)
+        # 对齐到 [B,n,n]
+        if b.size(1) != n or b.size(2) != n:
+            b = b[:, :n, :n]
+        bias_h = b.unsqueeze(1)  # [B,1,n,n]
+
+    # ---------------------------
+    # helper: chunked attention (relu(QK^T + bias)/n) * mask
+    # returns: [B,n,H,dv]
+    # ---------------------------
+    def _chunked_relu_attn(qh, kh, vh, bias_h_local):
+        # qh/kh: [B,H,n,d], vh: [B,H,n,dv]
+        B0, H0, N0, _ = qh.shape
+        out = torch.empty((B0, H0, N0, linear_dim), device=qh.device, dtype=vh.dtype)
+
+        for qs in range(0, N0, q_chunk_size):
+            qe = min(qs + q_chunk_size, N0)
+            # scores: [B,H,qe-qs,n]
+            scores = torch.einsum("bhqd,bhkd->bhqk", qh[:, :, qs:qe, :], kh)
+            if bias_h_local is not None:
+                scores = scores + bias_h_local[:, :, qs:qe, :]  # broadcast heads
+            scores = F.relu(scores) / float(n)
+            scores = scores * mask_h[:, :, qs:qe, :]  # [B,1,q,n] -> broadcast heads
+            # out chunk: [B,H,q,dv]
+            out[:, :, qs:qe, :] = torch.einsum("bhqk,bhkd->bhqd", scores, vh)
+            # 释放 chunk 大张量，降低峰值
+            del scores
+        return out  # [B,H,n,dv]
+
+    # ---------------------------
+    # 6) plain branch
+    # ---------------------------
+    qh = q4.permute(0, 2, 1, 3).contiguous()        # [B,H,n,d]
+    kh = k4.permute(0, 2, 1, 3).contiguous()        # [B,H,n,d]
+    vh = padded_v.permute(0, 2, 1, 3).contiguous()  # [B,H,n,dv]
+
+    attn_plain_h = _chunked_relu_attn(qh, kh, vh, bias_h)          # [B,H,n,dv]
+    attn_plain = attn_plain_h.permute(0, 2, 1, 3).contiguous()     # [B,n,H,dv]
+
+    # ---------------------------
+    # 7) rope branch
+    # ---------------------------
+    if rope is not None:
+        qh_rope, kh_rope = rope.apply_rotary(qh, kh)               # [B,H,n,d]
+        attn_rope_h = _chunked_relu_attn(qh_rope, kh_rope, vh, bias_h)
+        attn_rope = attn_rope_h.permute(0, 2, 1, 3).contiguous()   # [B,n,H,dv]
+        del qh_rope, kh_rope, attn_rope_h
+    else:
+        attn_rope = torch.zeros_like(attn_plain)
+
+    # ---------------------------
+    # 8) explicit time-bucket aggregation: ts_output = einsum(rel_ts_bias, V)
+    # ---------------------------
+    if (all_timestamps is not None) and (rel_ts_bias_module is not None):
+        ts2 = all_timestamps
+        if ts2.dim() != 2:
+            raise ValueError(f"all_timestamps must be [B,T], got {ts2.shape}")
+        if ts2.size(1) < n:
+            pad = ts2[:, -1:].expand(-1, n - ts2.size(1))
+            ts2 = torch.cat([ts2, pad], dim=1)
+        elif ts2.size(1) > n:
+            ts2 = ts2[:, :n]
+
+        rel_ts_bias = rel_ts_bias_module(ts2)  # 期望 [B,n,n] 或可 broadcast
+        if rel_ts_bias.dim() == 3 and rel_ts_bias.size(0) == 1:
+            rel_ts_bias = rel_ts_bias.expand(B, -1, -1)
+        elif rel_ts_bias.dim() == 2:
+            rel_ts_bias = rel_ts_bias.unsqueeze(0).expand(B, -1, -1)
+
         if rel_ts_bias.size(1) != n or rel_ts_bias.size(2) != n:
             rel_ts_bias = rel_ts_bias[:, :n, :n]
 
         rel_ts_bias = rel_ts_bias * invalid  # [B,n,n]
         ts_output = torch.einsum("bnm,bmhd->bnhd", rel_ts_bias, padded_v)  # [B,n,H,dv]
-        del rel_ts_bias, ts
+        del rel_ts_bias, ts2
     else:
         ts_output = torch.zeros_like(attn_plain)
 
-
-    # 7) 三路 concat -> 投影回 [B,N,H*dv]
-    three = torch.cat([attn_plain, attn_rope, ts_output], dim=-1)  # [B,N,H,3*dv]
-    three = three.reshape(B, n, num_heads * linear_dim * 3)        # [B,N,3*H*dv]
+    # ---------------------------
+    # 9) three-way concat + proj back to [B,n,H*dv]
+    # ---------------------------
+    three = torch.cat([attn_plain, attn_rope, ts_output], dim=-1)      # [B,n,H,3*dv]
+    three = three.reshape(B, n, num_heads * linear_dim * 3)            # [B,n,3*H*dv]
 
     if attn_out_proj is None:
-        # fallback：不投影（不推荐），但后续 u*... 会维度不匹配
-        merged = three
-    else:
-        merged = attn_out_proj(three)  # [B,N,H*dv]
+        raise ValueError("attn_out_proj must not be None (otherwise downstream dims mismatch).")
+    merged = attn_out_proj(three)                                       # [B,n,H*dv]
 
-    # 8) padded -> jagged
+    # ---------------------------
+    # 10) padded -> jagged
+    # ---------------------------
     attn_output = torch.ops.fbgemm.dense_to_jagged(merged, [x_offsets])[0]
+    # 释放大中间变量
+    del qh, kh, vh, attn_plain_h, attn_plain, attn_rope, ts_output, three, merged
+
     return attn_output, padded_q, padded_k
+
 
 
 
@@ -539,6 +596,7 @@ class SequentialTransductionUnitJagged(torch.nn.Module):
                 x_offsets=x_offsets,
                 all_timestamps=all_timestamps,
                 invalid_attn_mask=invalid_attn_mask,
+                rel_attn_bias=self._rel_attn_bias, 
                 rel_ts_bias_module=self._rel_ts_bias,
                 rope=self._rope,
                 attn_out_proj=self._attn_out_proj,
