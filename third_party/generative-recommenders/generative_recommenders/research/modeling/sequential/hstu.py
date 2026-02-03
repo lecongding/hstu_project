@@ -285,7 +285,17 @@ def _hstu_attention_maybe_from_cache(
     k4 = padded_k.view(B, n, num_heads, attention_dim)  # [B,N,H,d]
 
     # mask：invalid_attn_mask 是 (B,N,N) float 0/1，扩到 head 维
-    mask_h = invalid_attn_mask.unsqueeze(1)  # [B,1,N,N]
+    # ---- normalize invalid_attn_mask to [B, n, n] ----
+    if invalid_attn_mask.dim() == 2:
+        # original HSTU passes [n, n]
+        invalid = invalid_attn_mask.unsqueeze(0).expand(B, -1, -1)  # [B,n,n]
+    elif invalid_attn_mask.dim() == 3:
+        invalid = invalid_attn_mask  # [B,n,n]
+    else:
+        raise ValueError(f"invalid_attn_mask must be 2D or 3D, got {invalid_attn_mask.shape}")
+
+    mask_h = invalid.unsqueeze(1)  # [B,1,n,n]
+
 
     # 4) plain attention: relu(QK^T)/N
     qh0 = q4.permute(0, 2, 1, 3).contiguous()  # [B,H,N,d]
@@ -326,15 +336,30 @@ def _hstu_attention_maybe_from_cache(
         attn_rope = torch.zeros_like(attn_plain)
 
 
-    # 6) 显式时间桶聚合: ts_output = einsum(rel_ts_bias, V)
+        # 6) explicit time-bucket aggregation: ts_output = einsum(rel_ts_bias, V)
     if (all_timestamps is not None) and (rel_ts_bias_module is not None):
-        rel_ts_bias = rel_ts_bias_module(all_timestamps)  # [B,N,N]
-        rel_ts_bias = rel_ts_bias * invalid_attn_mask      # causal/valid mask
-        ts_output = torch.einsum("bnm,bmhd->bnhd", rel_ts_bias, padded_v)  # [B,N,H,dv]
-        del rel_ts_bias
+        ts = all_timestamps
+        # ts expected to be [B, n] (or >=n). Make it exactly [B, n]
+        if ts.dim() != 2:
+            raise ValueError(f"all_timestamps must be [B, T], got {ts.shape}")
+        if ts.size(1) < n:
+            # pad with last timestamp to length n
+            pad = ts[:, -1:].expand(-1, n - ts.size(1))
+            ts = torch.cat([ts, pad], dim=1)
+        elif ts.size(1) > n:
+            ts = ts[:, :n]
 
+        rel_ts_bias = rel_ts_bias_module(ts)  # ideally [B,n,n] but may be bigger
+        # make it exactly [B,n,n]
+        if rel_ts_bias.size(1) != n or rel_ts_bias.size(2) != n:
+            rel_ts_bias = rel_ts_bias[:, :n, :n]
+
+        rel_ts_bias = rel_ts_bias * invalid  # [B,n,n]
+        ts_output = torch.einsum("bnm,bmhd->bnhd", rel_ts_bias, padded_v)  # [B,n,H,dv]
+        del rel_ts_bias, ts
     else:
         ts_output = torch.zeros_like(attn_plain)
+
 
     # 7) 三路 concat -> 投影回 [B,N,H*dv]
     three = torch.cat([attn_plain, attn_rope, ts_output], dim=-1)  # [B,N,H,3*dv]
